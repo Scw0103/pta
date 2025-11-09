@@ -48,7 +48,7 @@ public class PreprocessResult {
      * @return id of the object allocated
      */
     public int getObjIdAt(New stmt) {
-        return obj_ids.get(stmt);
+        return obj_ids.getOrDefault(stmt, 0);
     }
 
     /**
