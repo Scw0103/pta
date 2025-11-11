@@ -62,6 +62,7 @@ public final class ModularAndersenSolver {
     private final HeapModel heapModel;
     private final FieldPolicy fieldPolicy;
 
+    // 约束传播使用的有向图：节点为变量/字段/数组，边表示 points-to 流向
     private final Graph graph = new Graph();
     private final PointsRepository pointsRepository = new PointsRepository();
     private final Deque<WorkItem> workList = new ArrayDeque<>();
@@ -84,6 +85,7 @@ public final class ModularAndersenSolver {
     ModularAndersenSolver(HeapModel heapModel, FieldPolicy fieldPolicy) {
         this.heapModel = heapModel;
         this.fieldPolicy = fieldPolicy;
+        this.fieldPolicy.bind(pointsRepository);
     }
 
     PointerAnalysisResult solve() {
@@ -98,6 +100,7 @@ public final class ModularAndersenSolver {
     // ------------------------------------------------------------
 
     private void initialize() {
+        // 每次求解前都重置预处理信息和最终结果容器
         preprocessResult = new PreprocessResult();
         finalResult = new PointerAnalysisResult();
 
@@ -105,6 +108,7 @@ public final class ModularAndersenSolver {
             logger.info("Indexing class {}", jclass.getName());
             jclass.getDeclaredMethods().forEach(method -> {
                 if (!method.isAbstract()) {
+                    // 预处理阶段解析 Benchmark.alloc/test 标签，记录对象编号与测试点
                     preprocessResult.analysis(method.getIR());
                 }
             });
@@ -121,6 +125,7 @@ public final class ModularAndersenSolver {
         }
         MethodSummary summary = methodSummaries.computeIfAbsent(method, this::createSummary);
         logger.debug("Processing method {}", method.getSignature());
+        // 首次遇到该方法时，对 IR 中的每条语句收集约束
         method.getIR().getStmts().forEach(stmt -> stmt.accept(new ConstraintCollector(summary)));
     }
 
@@ -138,6 +143,15 @@ public final class ModularAndersenSolver {
     // Constraint collection
     // ------------------------------------------------------------
 
+    /**
+     * ConstraintCollector 将 IR 语句转换为图上的边或待传播对象：
+     * <ul>
+     *   <li>标量赋值/字段/数组操作：统一建边到 {@link Graph}，在传播阶段沿边扩散 points-to。</li>
+     *   <li>对象创建：直接将新抽象对象加入工作队列，以便立即触发传播。</li>
+     *   <li>调用语句：构造 {@link CallSiteRecord}，静态调用即时接线，实例调用延迟到接收者集更新。</li>
+     * </ul>
+     * 收集过程中所有 Var/Field/Array 都经由 Node factory 缓存，确保同一 IR 元素映射到唯一节点。
+     */
     private final class ConstraintCollector implements StmtVisitor<Void> {
 
     @SuppressWarnings("unused")
@@ -151,6 +165,7 @@ public final class ModularAndersenSolver {
         public Void visit(New stmt) {
             VarNode target = getVarNode(stmt.getLValue());
             Obj obj = heapModel.getObj(stmt);
+            // new 语句：立即将抽象对象放入工作队列，触发后续传播
             enqueue(target, Set.of(obj));
             return null;
         }
@@ -159,6 +174,7 @@ public final class ModularAndersenSolver {
         public Void visit(Copy stmt) {
             VarNode from = getVarNode(stmt.getRValue());
             VarNode to = getVarNode(stmt.getLValue());
+            // 标量赋值：记录一条 from -> to 的流向边
             graph.addEdge(from, to);
             return null;
         }
@@ -169,14 +185,16 @@ public final class ModularAndersenSolver {
             if (stmt.isStatic()) {
                 FieldAccess access = stmt.getFieldAccess();
                 FieldNode field = getStaticFieldNode(access.getFieldRef());
+                // 静态字段写：所有对象共享，直接 value -> staticField
                 graph.addEdge(value, field);
             } else {
-                InstanceFieldAccess instanceAccess =
-                        (InstanceFieldAccess) stmt.getFieldAccess();
-                FieldNode field = getInstanceFieldNode(instanceAccess.getFieldRef());
-                graph.addEdge(value, field);
-                VarNode base = getVarNode(instanceAccess.getBase());
-                fieldPolicy.registerBase(base);
+        InstanceFieldAccess instanceAccess =
+            (InstanceFieldAccess) stmt.getFieldAccess();
+        FieldRef fieldRef = instanceAccess.getFieldRef();
+        FieldNode summary = getInstanceFieldNode(fieldRef);
+        VarNode base = getVarNode(instanceAccess.getBase());
+        // 实例字段写：交由 FieldPolicy 选择拆分策略
+        fieldPolicy.registerStoreField(base, fieldRef, value, summary, graph, ModularAndersenSolver.this::enqueue);
             }
             return null;
         }
@@ -187,14 +205,16 @@ public final class ModularAndersenSolver {
             if (stmt.isStatic()) {
                 FieldAccess access = stmt.getFieldAccess();
                 FieldNode field = getStaticFieldNode(access.getFieldRef());
+                // 静态字段读：staticField -> target
                 graph.addEdge(field, target);
             } else {
-                InstanceFieldAccess instanceAccess =
-                        (InstanceFieldAccess) stmt.getFieldAccess();
-                FieldNode field = getInstanceFieldNode(instanceAccess.getFieldRef());
-                graph.addEdge(field, target);
-                VarNode base = getVarNode(instanceAccess.getBase());
-                fieldPolicy.registerBase(base);
+        InstanceFieldAccess instanceAccess =
+            (InstanceFieldAccess) stmt.getFieldAccess();
+        FieldRef fieldRef = instanceAccess.getFieldRef();
+        FieldNode summary = getInstanceFieldNode(fieldRef);
+        VarNode base = getVarNode(instanceAccess.getBase());
+        // 实例字段读：完全交给 FieldPolicy 控制传播行为
+        fieldPolicy.registerLoadField(base, fieldRef, target, summary, graph, ModularAndersenSolver.this::enqueue);
             }
             return null;
         }
@@ -204,6 +224,7 @@ public final class ModularAndersenSolver {
             VarNode value = getVarNode(stmt.getRValue());
             ArrayAccess access = stmt.getArrayAccess();
             ArrayNode array = getArrayNode(access.getBase());
+            // 数组写：按 field-insensitive 策略把整个数组视为单节点
             graph.addEdge(value, array);
             return null;
         }
@@ -213,6 +234,7 @@ public final class ModularAndersenSolver {
             VarNode target = getVarNode(stmt.getLValue());
             ArrayAccess access = stmt.getArrayAccess();
             ArrayNode array = getArrayNode(access.getBase());
+            // 数组读：array -> target
             graph.addEdge(array, target);
             return null;
         }
@@ -223,8 +245,10 @@ public final class ModularAndersenSolver {
             callSites.put(stmt, site);
             if (stmt.isStatic()) {
                 JMethod callee = resolveStatic(stmt);
+                // 静态调用：类型已知，立即完成参数/返回连线
                 dispatchCall(site, callee, null);
             } else {
+                // 实例调用：延迟到接收者 points-to 更新时再解析虚调用
                 receivers.computeIfAbsent(site.receiver, key -> new ArrayList<>()).add(site);
             }
             return null;
@@ -297,10 +321,12 @@ public final class ModularAndersenSolver {
             if (diff.isEmpty()) {
                 continue;
             }
+            // 将新增的对象沿图上的边继续传播
             for (Node succ : graph.getSuccessors(node)) {
                 enqueue(succ, diff);
             }
             if (node instanceof VarNode varNode) {
+                // 域策略可以基于新对象展开附加约束（如字段敏感）
                 fieldPolicy.handleVarPoints(varNode, diff, this::enqueue, graph);
                 propagateCalls(varNode, diff);
             }
@@ -347,6 +373,7 @@ public final class ModularAndersenSolver {
                     }
                 }
             }
+            // 最终结果采用测试点编号映射到对象编号集合
             finalResult.put(testId, indices);
         });
         dumpToFile(finalResult);
