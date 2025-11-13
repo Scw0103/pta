@@ -2,6 +2,8 @@ package pta.andersen;
 
 import pku.PointerAnalysisResult;
 import pku.PreprocessResult;
+import pta.andersen.ModularAndersenSolver.FieldNode;
+import pta.andersen.ModularAndersenSolver.VarNode;
 import pascal.taie.World;
 import pascal.taie.analysis.graph.callgraph.CallGraphs;
 import pascal.taie.analysis.graph.callgraph.CallKind;
@@ -34,6 +36,7 @@ import pascal.taie.ir.stmt.StoreField;
 import pascal.taie.ir.stmt.StmtVisitor;
 import pascal.taie.ir.stmt.Throw;
 import pascal.taie.language.classes.JMethod;
+import pascal.taie.language.type.ArrayType;
 import pascal.taie.analysis.misc.IRDumper;
 
 import org.apache.logging.log4j.LogManager;
@@ -46,6 +49,7 @@ import java.io.PrintStream;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -55,6 +59,9 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+import javax.naming.Context;
 
 /**
  * A modular, field-insensitive Andersen-style pointer analysis tailored for Taie.
@@ -89,7 +96,14 @@ public final class ModularAndersenSolver {
     private final Map<VarKey, VarNode> varNodes = new HashMap<>();
     private final Map<FieldKey, FieldNode> fieldNodes = new HashMap<>();
     private final Map<FieldRef, FieldNode> staticFieldNodes = new HashMap<>();
-    private final Map<ArrayKey, ArrayNode> arrayNodes = new HashMap<>();
+    
+    // 移除原有的 arrayNodes，改用新的分配点敏感数组节点
+    private final Map<AllocationArrayKey, AllocationSiteArrayNode> allocationArrayNodes = new HashMap<>();
+    private final Map<VarNode, List<AllocationSiteArrayNode>> varToArrayNodes = new HashMap<>();
+    
+    // 延迟处理的数组约束
+    private final Map<VarNode, List<ArrayStoreConstraint>> pendingArrayStores = new HashMap<>();
+    private final Map<VarNode, List<ArrayLoadConstraint>> pendingArrayLoads = new HashMap<>();
 
     private final Map<VarNode, List<CallSiteRecord>> receivers = new HashMap<>();
     private final Set<MethodKey> enqueuedMethods = new HashSet<>();
@@ -104,7 +118,7 @@ public final class ModularAndersenSolver {
         this.fieldPolicy = Objects.requireNonNull(fieldPolicy);
         this.contextDepth = Math.max(0, contextDepth);
         this.objectDepth = Math.max(0, objectDepth);
-    this.timeBudgetNanos = TimeUnit.SECONDS.toNanos(59);
+        this.timeBudgetNanos = TimeUnit.SECONDS.toNanos(59);
         this.fieldPolicy.bind(pointsRepository);
     }
 
@@ -141,9 +155,9 @@ public final class ModularAndersenSolver {
             });
         });
 
-    JMethod entry = World.get().getMainMethod();
-    callGraph.addEntryMethod(entry);
-    enqueueMethod(entry, Context.root());
+        JMethod entry = World.get().getMainMethod();
+        callGraph.addEntryMethod(entry);
+        enqueueMethod(entry, Context.root());
     }
 
     private void enqueueMethod(JMethod method, Context context) {
@@ -183,7 +197,7 @@ public final class ModularAndersenSolver {
      */
     private final class ConstraintCollector implements StmtVisitor<Void> {
 
-    private final MethodSummary summary;
+        private final MethodSummary summary;
         private final Context context;
 
         private ConstraintCollector(MethodSummary summary, Context context) {
@@ -195,6 +209,14 @@ public final class ModularAndersenSolver {
         public Void visit(New stmt) {
             VarNode target = getVarNode(stmt.getLValue(), context);
             Obj obj = heapModel.getObj(stmt);
+            
+            // 如果是数组类型，注册数组变量到分配点的映射
+            
+            if (stmt.getLValue().getType() instanceof ArrayType) {
+                logger.info("Registering array allocation for {} at {}", stmt.getLValue(), stmt);
+                registerArrayAllocation(target, obj, stmt.getLValue());
+            }
+            
             // new 语句：立即将抽象对象放入工作队列，触发后续传播
             enqueue(target, Set.of(obj));
             return null;
@@ -274,9 +296,12 @@ public final class ModularAndersenSolver {
         public Void visit(StoreArray stmt) {
             VarNode value = getVarNode(stmt.getRValue(), context);
             ArrayAccess access = stmt.getArrayAccess();
-            ArrayNode array = getArrayNode(access.getBase(), context);
-            // 数组写：按 field-insensitive 策略把整个数组视为单节点
-            graph.addEdge(value, array);
+            Var arrayVar = access.getBase();
+            VarNode arrayVarNode = getVarNode(arrayVar, context);
+            
+            // 延迟处理：等待arrayVar的指向集确定
+            pendingArrayStores.computeIfAbsent(arrayVarNode, k -> new ArrayList<>())
+                .add(new ArrayStoreConstraint(value, access.getIndex()));
             return null;
         }
 
@@ -284,9 +309,12 @@ public final class ModularAndersenSolver {
         public Void visit(LoadArray stmt) {
             VarNode target = getVarNode(stmt.getLValue(), context);
             ArrayAccess access = stmt.getArrayAccess();
-            ArrayNode array = getArrayNode(access.getBase(), context);
-            // 数组读：array -> target
-            graph.addEdge(array, target);
+            Var arrayVar = access.getBase();
+            VarNode arrayVarNode = getVarNode(arrayVar, context);
+            
+            // 延迟处理
+            pendingArrayLoads.computeIfAbsent(arrayVarNode, k -> new ArrayList<>())
+                .add(new ArrayLoadConstraint(target, access.getIndex()));
             return null;
         }
 
@@ -378,7 +406,7 @@ public final class ModularAndersenSolver {
         if (callee == null) {
             return;
         }
-    Context calleeContext = deriveContext(site.context, site.invoke, receiverObj);
+        Context calleeContext = deriveContext(site.context, site.invoke, receiverObj);
         MethodKey calleeKey = new MethodKey(callee, calleeContext);
         if (!site.resolvedCallees.add(calleeKey)) {
             return;
@@ -441,8 +469,54 @@ public final class ModularAndersenSolver {
                 // 域策略可以基于新对象展开附加约束（如字段敏感）
                 fieldPolicy.handleVarPoints(varNode, diff, this::enqueue, graph);
                 propagateCalls(varNode, diff);
+                // 处理数组约束
+                propagateArrayConstraints(varNode, diff);
                 if (aborted) {
                     return;
+                }
+            }
+        }
+    }
+
+    private void propagateArrayConstraints(VarNode arrayVarNode, Set<Obj> newObjects) {
+        Var arrayVar = arrayVarNode.var;
+        
+        // 处理数组存储约束
+        List<ArrayStoreConstraint> stores = pendingArrayStores.get(arrayVarNode);
+        if (stores != null) {
+            for (Obj obj : newObjects) {
+                if (obj.getAllocation() instanceof New) { // 确保是数组对象
+                    AllocationSiteArrayNode arrayNode = 
+                        getAllocationSiteArrayNode(obj, arrayVar, arrayVarNode.context);
+                    
+                    for (ArrayStoreConstraint store : stores) {
+                        // 建立存储边：value → arrayNode
+                        graph.addEdge(store.value, arrayNode);
+                        Set<Obj> existing = pointsRepository.get(store.value);
+                        if (existing != null && !existing.isEmpty()) {
+                            enqueue(arrayNode, existing);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // 处理数组加载约束
+        List<ArrayLoadConstraint> loads = pendingArrayLoads.get(arrayVarNode);
+        if (loads != null) {
+            for (Obj obj : newObjects) {
+                if (obj.getAllocation() instanceof New) {
+                    AllocationSiteArrayNode arrayNode = 
+                        getAllocationSiteArrayNode(obj, arrayVar, arrayVarNode.context);
+                    
+                    for (ArrayLoadConstraint load : loads) {
+                        // 建立加载边：arrayNode → target
+                        graph.addEdge(arrayNode, load.target);
+                        Set<Obj> existing = pointsRepository.get(arrayNode);
+                        if (existing != null && !existing.isEmpty()) {
+                            enqueue(load.target, existing);
+                        }
+                    }
                 }
             }
         }
@@ -502,7 +576,34 @@ public final class ModularAndersenSolver {
             // 最终结果采用测试点编号映射到对象编号集合
             finalResult.put(testId, indices);
         });
+        
+        // 输出数组分析结果用于调试
+        dumpArrayResults();
         dumpToFile(finalResult);
+    }
+
+    private void dumpArrayResults() {
+        Map<String, Set<Integer>> arrayResults = new HashMap<>();
+        
+        allocationArrayNodes.forEach((key, arrayNode) -> {
+            Set<Obj> pts = pointsRepository.get(arrayNode);
+            if (pts != null && !pts.isEmpty()) {
+                String arrayKey = "Array@" + key.allocation() + ":" + key.arrayVar().getName();
+                TreeSet<Integer> values = new TreeSet<>();
+                for (Obj pointedObj : pts) {
+                    Object alloc = pointedObj.getAllocation();
+                    if (alloc instanceof New newStmt) {
+                        int id = preprocessResult.getObjIdAt(newStmt);
+                        if (id > 0) values.add(id);
+                    }
+                }
+                arrayResults.put(arrayKey, values);
+            }
+        });
+        
+        // 输出数组分析结果
+        logger.info("Array Analysis Results:");
+        arrayResults.forEach((k, v) -> logger.info("  {} -> {}", k, v));
     }
 
     private void dumpToFile(PointerAnalysisResult result) {
@@ -550,6 +651,19 @@ public final class ModularAndersenSolver {
     }
 
     // ------------------------------------------------------------
+    // Array Allocation Registration
+    // ------------------------------------------------------------
+
+    private void registerArrayAllocation(VarNode target, Obj allocation, Var arrayVar) {
+        // 为这个分配点创建数组节点
+        AllocationSiteArrayNode arrayNode = 
+            getAllocationSiteArrayNode(allocation, arrayVar, target.context);
+        
+        // 建立变量到数组节点的映射
+        varToArrayNodes.computeIfAbsent(target, k -> new ArrayList<>()).add(arrayNode);
+    }
+
+    // ------------------------------------------------------------
     // Node factories
     // ------------------------------------------------------------
 
@@ -567,9 +681,10 @@ public final class ModularAndersenSolver {
         return staticFieldNodes.computeIfAbsent(ref, key -> new FieldNode(key, true, Context.root()));
     }
 
-    private ArrayNode getArrayNode(Var arrayVar, Context context) {
-        ArrayKey key = new ArrayKey(context, arrayVar);
-        return arrayNodes.computeIfAbsent(key, k -> new ArrayNode(k.context(), k.arrayVar()));
+    private AllocationSiteArrayNode getAllocationSiteArrayNode(Obj allocation, Var arrayVar, Context context) {
+        AllocationArrayKey key = new AllocationArrayKey(allocation, arrayVar, context);
+        return allocationArrayNodes.computeIfAbsent(key, 
+            k -> new AllocationSiteArrayNode(k.allocation(), k.arrayVar(), k.context()));
     }
 
     // ------------------------------------------------------------
@@ -586,7 +701,29 @@ public final class ModularAndersenSolver {
 
     private record FieldKey(Context context, FieldRef fieldRef) { }
 
-    private record ArrayKey(Context context, Var arrayVar) { }
+    private record AllocationArrayKey(Obj allocation, Var arrayVar, Context context) { }
+
+    // 数组存储约束记录
+    private static class ArrayStoreConstraint {
+        final VarNode value;
+        final Var index;
+        
+        ArrayStoreConstraint(VarNode value, Var index) {
+            this.value = value;
+            this.index = index;
+        }
+    }
+
+    // 数组加载约束记录  
+    private static class ArrayLoadConstraint {
+        final VarNode target;
+        final Var index;
+        
+        ArrayLoadConstraint(VarNode target, Var index) {
+            this.target = target;
+            this.index = index;
+        }
+    }
 
     /**
      * Immutable context that keeps both call-string and object-sensitive information.
@@ -784,43 +921,48 @@ public final class ModularAndersenSolver {
         }
     }
 
-    static final class ArrayNode implements Node {
+    /**
+     * 基于分配点的数组分区节点
+     * 每个分配点创建一个独立的数组节点，避免不同数组间的污染
+     */
+    static final class AllocationSiteArrayNode implements Node {
+        final Obj allocation;  // 数组分配点对象
+        final Var arrayVar;    // 原始数组变量（用于调试）
         final Context context;
-        final Var arrayVar;
 
-        ArrayNode(Context context, Var arrayVar) {
-            this.context = Objects.requireNonNull(context);
+        AllocationSiteArrayNode(Obj allocation, Var arrayVar, Context context) {
+            this.allocation = Objects.requireNonNull(allocation);
             this.arrayVar = Objects.requireNonNull(arrayVar);
+            this.context = Objects.requireNonNull(context);
         }
 
         @Override
         public boolean equals(Object obj) {
-            if (!(obj instanceof ArrayNode other)) {
-                return false;
-            }
-            return context.equals(other.context) && arrayVar.equals(other.arrayVar);
+            if (this == obj) return true;
+            if (!(obj instanceof AllocationSiteArrayNode other)) return false;
+            return allocation.equals(other.allocation) && context.equals(other.context);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(context, arrayVar);
+            return Objects.hash(allocation, context);
         }
 
         @Override
         public String toString() {
-            return "ArrayNode{" + arrayVar + "@" + context + '}';
+            return "AllocationSiteArrayNode{" + allocation + ":" + arrayVar + "@" + context + '}';
         }
     }
 
     private static final class MethodSummary {
-    @SuppressWarnings("unused")
-    final JMethod method;
-    @SuppressWarnings("unused")
-    final Context context;
+        @SuppressWarnings("unused")
+        final JMethod method;
+        @SuppressWarnings("unused")
+        final Context context;
         final List<VarNode> formals = new ArrayList<>();
         final List<VarNode> returns = new ArrayList<>();
-    final List<VarNode> catches = new ArrayList<>();
-    final List<VarNode> throwers = new ArrayList<>();
+        final List<VarNode> catches = new ArrayList<>();
+        final List<VarNode> throwers = new ArrayList<>();
         VarNode thisNode;
 
         MethodSummary(JMethod method, Context context) {
@@ -835,7 +977,7 @@ public final class ModularAndersenSolver {
         final VarNode receiver;
         final VarNode result;
         final List<VarNode> arguments;
-    final Set<MethodKey> resolvedCallees = new HashSet<>();
+        final Set<MethodKey> resolvedCallees = new HashSet<>();
 
         CallSiteRecord(Invoke invoke, Context context, VarNode receiver, VarNode result, List<VarNode> arguments) {
             this.invoke = invoke;
