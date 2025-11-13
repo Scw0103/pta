@@ -61,30 +61,32 @@ public final class ModularAndersenSolver {
 
     private final HeapModel heapModel;
     private final FieldPolicy fieldPolicy;
+    private final int contextDepth;
 
     // 约束传播使用的有向图：节点为变量/字段/数组，边表示 points-to 流向
     private final Graph graph = new Graph();
     private final PointsRepository pointsRepository = new PointsRepository();
     private final Deque<WorkItem> workList = new ArrayDeque<>();
 
-    private final Map<JMethod, MethodSummary> methodSummaries = new HashMap<>();
-    private final Map<Invoke, CallSiteRecord> callSites = new HashMap<>();
-    private final Map<Var, VarNode> varNodes = new HashMap<>();
-    private final Map<FieldRef, FieldNode> fieldNodes = new HashMap<>();
+    private final Map<MethodKey, MethodSummary> methodSummaries = new HashMap<>();
+    private final Map<CallSiteKey, CallSiteRecord> callSites = new HashMap<>();
+    private final Map<VarKey, VarNode> varNodes = new HashMap<>();
+    private final Map<FieldKey, FieldNode> fieldNodes = new HashMap<>();
     private final Map<FieldRef, FieldNode> staticFieldNodes = new HashMap<>();
-    private final Map<Var, ArrayNode> arrayNodes = new HashMap<>();
+    private final Map<ArrayKey, ArrayNode> arrayNodes = new HashMap<>();
 
     private final Map<VarNode, List<CallSiteRecord>> receivers = new HashMap<>();
-    private final Set<JMethod> enqueuedMethods = new HashSet<>();
+    private final Set<MethodKey> enqueuedMethods = new HashSet<>();
 
     private final DefaultCallGraph callGraph = new DefaultCallGraph();
 
     private PreprocessResult preprocessResult;
     private PointerAnalysisResult finalResult;
 
-    ModularAndersenSolver(HeapModel heapModel, FieldPolicy fieldPolicy) {
-        this.heapModel = heapModel;
-        this.fieldPolicy = fieldPolicy;
+    ModularAndersenSolver(HeapModel heapModel, FieldPolicy fieldPolicy, int contextDepth) {
+        this.heapModel = Objects.requireNonNull(heapModel);
+        this.fieldPolicy = Objects.requireNonNull(fieldPolicy);
+        this.contextDepth = Math.max(0, contextDepth);
         this.fieldPolicy.bind(pointsRepository);
     }
 
@@ -114,28 +116,30 @@ public final class ModularAndersenSolver {
             });
         });
 
-        JMethod entry = World.get().getMainMethod();
-        callGraph.addEntryMethod(entry);
-        enqueueMethod(entry);
+    JMethod entry = World.get().getMainMethod();
+    callGraph.addEntryMethod(entry);
+    enqueueMethod(entry, Context.root());
     }
 
-    private void enqueueMethod(JMethod method) {
-        if (!enqueuedMethods.add(method)) {
+    private void enqueueMethod(JMethod method, Context context) {
+        MethodKey key = new MethodKey(method, context);
+        if (!enqueuedMethods.add(key)) {
             return;
         }
-        MethodSummary summary = methodSummaries.computeIfAbsent(method, this::createSummary);
-        logger.debug("Processing method {}", method.getSignature());
+        MethodSummary summary = methodSummaries.computeIfAbsent(key,
+                k -> createSummary(k.method(), k.context()));
+        logger.debug("Processing method {} @ {}", method.getSignature(), context);
         // 首次遇到该方法时，对 IR 中的每条语句收集约束
-        method.getIR().getStmts().forEach(stmt -> stmt.accept(new ConstraintCollector(summary)));
+        method.getIR().getStmts().forEach(stmt -> stmt.accept(new ConstraintCollector(summary, context)));
     }
 
-    private MethodSummary createSummary(JMethod method) {
-        MethodSummary summary = new MethodSummary(method);
+    private MethodSummary createSummary(JMethod method, Context context) {
+        MethodSummary summary = new MethodSummary(method, context);
         if (!method.isStatic()) {
-            summary.thisNode = getVarNode(method.getIR().getThis());
+            summary.thisNode = getVarNode(method.getIR().getThis(), context);
         }
-        method.getIR().getParams().forEach(var -> summary.formals.add(getVarNode(var)));
-        method.getIR().getReturnVars().forEach(var -> summary.returns.add(getVarNode(var)));
+        method.getIR().getParams().forEach(var -> summary.formals.add(getVarNode(var, context)));
+        method.getIR().getReturnVars().forEach(var -> summary.returns.add(getVarNode(var, context)));
         return summary;
     }
 
@@ -154,16 +158,18 @@ public final class ModularAndersenSolver {
      */
     private final class ConstraintCollector implements StmtVisitor<Void> {
 
-    @SuppressWarnings("unused")
-    private final MethodSummary summary;
+        @SuppressWarnings("unused")
+        private final MethodSummary summary;
+        private final Context context;
 
-        private ConstraintCollector(MethodSummary summary) {
+        private ConstraintCollector(MethodSummary summary, Context context) {
             this.summary = summary;
+            this.context = context;
         }
 
         @Override
         public Void visit(New stmt) {
-            VarNode target = getVarNode(stmt.getLValue());
+            VarNode target = getVarNode(stmt.getLValue(), context);
             Obj obj = heapModel.getObj(stmt);
             // new 语句：立即将抽象对象放入工作队列，触发后续传播
             enqueue(target, Set.of(obj));
@@ -172,8 +178,8 @@ public final class ModularAndersenSolver {
 
         @Override
         public Void visit(Copy stmt) {
-            VarNode from = getVarNode(stmt.getRValue());
-            VarNode to = getVarNode(stmt.getLValue());
+            VarNode from = getVarNode(stmt.getRValue(), context);
+            VarNode to = getVarNode(stmt.getLValue(), context);
             // 标量赋值：记录一条 from -> to 的流向边
             graph.addEdge(from, to);
             return null;
@@ -181,49 +187,49 @@ public final class ModularAndersenSolver {
 
         @Override
         public Void visit(StoreField stmt) {
-            VarNode value = getVarNode(stmt.getRValue());
+            VarNode value = getVarNode(stmt.getRValue(), context);
             if (stmt.isStatic()) {
                 FieldAccess access = stmt.getFieldAccess();
                 FieldNode field = getStaticFieldNode(access.getFieldRef());
                 // 静态字段写：所有对象共享，直接 value -> staticField
                 graph.addEdge(value, field);
             } else {
-        InstanceFieldAccess instanceAccess =
-            (InstanceFieldAccess) stmt.getFieldAccess();
-        FieldRef fieldRef = instanceAccess.getFieldRef();
-        FieldNode summary = getInstanceFieldNode(fieldRef);
-        VarNode base = getVarNode(instanceAccess.getBase());
-        // 实例字段写：交由 FieldPolicy 选择拆分策略
-        fieldPolicy.registerStoreField(base, fieldRef, value, summary, graph, ModularAndersenSolver.this::enqueue);
+                InstanceFieldAccess instanceAccess =
+                        (InstanceFieldAccess) stmt.getFieldAccess();
+                FieldRef fieldRef = instanceAccess.getFieldRef();
+                FieldNode summary = getInstanceFieldNode(fieldRef, context);
+                VarNode base = getVarNode(instanceAccess.getBase(), context);
+                // 实例字段写：交由 FieldPolicy 选择拆分策略
+                fieldPolicy.registerStoreField(base, fieldRef, value, summary, graph, ModularAndersenSolver.this::enqueue);
             }
             return null;
         }
 
         @Override
         public Void visit(LoadField stmt) {
-            VarNode target = getVarNode(stmt.getLValue());
+            VarNode target = getVarNode(stmt.getLValue(), context);
             if (stmt.isStatic()) {
                 FieldAccess access = stmt.getFieldAccess();
                 FieldNode field = getStaticFieldNode(access.getFieldRef());
                 // 静态字段读：staticField -> target
                 graph.addEdge(field, target);
             } else {
-        InstanceFieldAccess instanceAccess =
-            (InstanceFieldAccess) stmt.getFieldAccess();
-        FieldRef fieldRef = instanceAccess.getFieldRef();
-        FieldNode summary = getInstanceFieldNode(fieldRef);
-        VarNode base = getVarNode(instanceAccess.getBase());
-        // 实例字段读：完全交给 FieldPolicy 控制传播行为
-        fieldPolicy.registerLoadField(base, fieldRef, target, summary, graph, ModularAndersenSolver.this::enqueue);
+                InstanceFieldAccess instanceAccess =
+                        (InstanceFieldAccess) stmt.getFieldAccess();
+                FieldRef fieldRef = instanceAccess.getFieldRef();
+                FieldNode summary = getInstanceFieldNode(fieldRef, context);
+                VarNode base = getVarNode(instanceAccess.getBase(), context);
+                // 实例字段读：完全交给 FieldPolicy 控制传播行为
+                fieldPolicy.registerLoadField(base, fieldRef, target, summary, graph, ModularAndersenSolver.this::enqueue);
             }
             return null;
         }
 
         @Override
         public Void visit(StoreArray stmt) {
-            VarNode value = getVarNode(stmt.getRValue());
+            VarNode value = getVarNode(stmt.getRValue(), context);
             ArrayAccess access = stmt.getArrayAccess();
-            ArrayNode array = getArrayNode(access.getBase());
+            ArrayNode array = getArrayNode(access.getBase(), context);
             // 数组写：按 field-insensitive 策略把整个数组视为单节点
             graph.addEdge(value, array);
             return null;
@@ -231,9 +237,9 @@ public final class ModularAndersenSolver {
 
         @Override
         public Void visit(LoadArray stmt) {
-            VarNode target = getVarNode(stmt.getLValue());
+            VarNode target = getVarNode(stmt.getLValue(), context);
             ArrayAccess access = stmt.getArrayAccess();
-            ArrayNode array = getArrayNode(access.getBase());
+            ArrayNode array = getArrayNode(access.getBase(), context);
             // 数组读：array -> target
             graph.addEdge(array, target);
             return null;
@@ -241,8 +247,8 @@ public final class ModularAndersenSolver {
 
         @Override
         public Void visit(Invoke stmt) {
-            CallSiteRecord site = buildCallSite(stmt);
-            callSites.put(stmt, site);
+            CallSiteRecord site = buildCallSite(stmt, context);
+            callSites.put(new CallSiteKey(stmt, context), site);
             if (stmt.isStatic()) {
                 JMethod callee = resolveStatic(stmt);
                 // 静态调用：类型已知，立即完成参数/返回连线
@@ -255,19 +261,19 @@ public final class ModularAndersenSolver {
         }
     }
 
-    private CallSiteRecord buildCallSite(Invoke stmt) {
+    private CallSiteRecord buildCallSite(Invoke stmt, Context context) {
         VarNode receiver = null;
         if (!stmt.isStatic()) {
             InvokeInstanceExp instanceExp = (InvokeInstanceExp) stmt.getInvokeExp();
-            receiver = getVarNode(instanceExp.getBase());
+            receiver = getVarNode(instanceExp.getBase(), context);
         }
         List<VarNode> args = new ArrayList<>();
         InvokeExp invokeExp = stmt.getInvokeExp();
         for (int i = 0; i < invokeExp.getArgCount(); i++) {
-            args.add(getVarNode(invokeExp.getArg(i)));
+            args.add(getVarNode(invokeExp.getArg(i), context));
         }
-        VarNode result = stmt.getLValue() != null ? getVarNode(stmt.getLValue()) : null;
-        return new CallSiteRecord(stmt, receiver, result, args);
+        VarNode result = stmt.getLValue() != null ? getVarNode(stmt.getLValue(), context) : null;
+        return new CallSiteRecord(stmt, context, receiver, result, args);
     }
 
     private JMethod resolveStatic(Invoke stmt) {
@@ -279,11 +285,13 @@ public final class ModularAndersenSolver {
         if (callee == null) {
             return;
         }
-        if (!site.resolvedCallees.add(callee)) {
-            return; // already wired
+        Context calleeContext = deriveContext(site.context, site.invoke);
+        MethodKey calleeKey = new MethodKey(callee, calleeContext);
+        if (!site.resolvedCallees.add(calleeKey)) {
+            return;
         }
-        enqueueMethod(callee);
-        MethodSummary summary = methodSummaries.get(callee);
+        enqueueMethod(callee, calleeContext);
+        MethodSummary summary = methodSummaries.get(calleeKey);
 
         if (callee.isStatic()) {
             for (int i = 0; i < site.arguments.size() && i < summary.formals.size(); i++) {
@@ -307,6 +315,13 @@ public final class ModularAndersenSolver {
         if (kind != null) {
             callGraph.addEdge(new Edge<>(kind, site.invoke, callee));
         }
+    }
+
+    private Context deriveContext(Context callerContext, Invoke invoke) {
+        if (contextDepth <= 0) {
+            return Context.root();
+        }
+        return callerContext.push(invoke, contextDepth);
     }
 
     // ------------------------------------------------------------
@@ -359,17 +374,23 @@ public final class ModularAndersenSolver {
 
     private void dumpResult() {
         preprocessResult.test_pts.forEach((testId, var) -> {
-            VarNode node = getVarNode(var);
-            Set<Obj> pts = pointsRepository.get(node);
+            Set<Obj> allPts = new HashSet<>();
+            // Aggregate points-to sets from all contexts for this variable
+            for (VarNode node : varNodes.values()) {
+                if (node.var.equals(var)) {
+                    Set<Obj> pts = pointsRepository.get(node);
+                    if (pts != null) {
+                        allPts.addAll(pts);
+                    }
+                }
+            }
             TreeSet<Integer> indices = new TreeSet<>();
-            if (pts != null) {
-                for (Obj obj : pts) {
-                    Object allocation = obj.getAllocation();
-                    if (allocation instanceof New newStmt) {
-                        int id = preprocessResult.getObjIdAt(newStmt);
-                        if (id > 0) {
-                            indices.add(id);
-                        }
+            for (Obj obj : allPts) {
+                Object allocation = obj.getAllocation();
+                if (allocation instanceof New newStmt) {
+                    int id = preprocessResult.getObjIdAt(newStmt);
+                    if (id > 0) {
+                        indices.add(id);
                     }
                 }
             }
@@ -392,20 +413,23 @@ public final class ModularAndersenSolver {
     // Node factories
     // ------------------------------------------------------------
 
-    private VarNode getVarNode(Var var) {
-        return varNodes.computeIfAbsent(var, VarNode::new);
+    private VarNode getVarNode(Var var, Context context) {
+        VarKey key = new VarKey(context, var);
+        return varNodes.computeIfAbsent(key, k -> new VarNode(k.context(), k.var()));
     }
 
-    private FieldNode getInstanceFieldNode(FieldRef ref) {
-        return fieldNodes.computeIfAbsent(ref, key -> new FieldNode(key, false));
+    private FieldNode getInstanceFieldNode(FieldRef ref, Context context) {
+        FieldKey key = new FieldKey(context, ref);
+        return fieldNodes.computeIfAbsent(key, k -> new FieldNode(k.fieldRef(), false, k.context()));
     }
 
     private FieldNode getStaticFieldNode(FieldRef ref) {
-        return staticFieldNodes.computeIfAbsent(ref, key -> new FieldNode(key, true));
+        return staticFieldNodes.computeIfAbsent(ref, key -> new FieldNode(key, true, Context.root()));
     }
 
-    private ArrayNode getArrayNode(Var arrayVar) {
-        return arrayNodes.computeIfAbsent(arrayVar, ArrayNode::new);
+    private ArrayNode getArrayNode(Var arrayVar, Context context) {
+        ArrayKey key = new ArrayKey(context, arrayVar);
+        return arrayNodes.computeIfAbsent(key, k -> new ArrayNode(k.context(), k.arrayVar()));
     }
 
     // ------------------------------------------------------------
@@ -413,6 +437,76 @@ public final class ModularAndersenSolver {
     // ------------------------------------------------------------
 
     private record WorkItem(Node node, Set<Obj> objects) { }
+
+    private record MethodKey(JMethod method, Context context) { }
+
+    private record CallSiteKey(Invoke invoke, Context context) { }
+
+    private record VarKey(Context context, Var var) { }
+
+    private record FieldKey(Context context, FieldRef fieldRef) { }
+
+    private record ArrayKey(Context context, Var arrayVar) { }
+
+    /**
+     * Immutable call-string context representation with a bounded depth.
+     */
+    private static final class Context {
+        private static final Context ROOT = new Context(List.of());
+
+        private final List<Invoke> frames; // most recent call first
+
+        private Context(List<Invoke> frames) {
+            this.frames = frames;
+        }
+
+        static Context root() {
+            return ROOT;
+        }
+
+        Context push(Invoke invoke, int maxDepth) {
+            if (maxDepth <= 0) {
+                return ROOT;
+            }
+            if (maxDepth == 1) {
+                return new Context(List.of(invoke));
+            }
+            List<Invoke> next = new ArrayList<>(Math.min(maxDepth, frames.size() + 1));
+            next.add(invoke);
+            for (int i = 0; i < frames.size() && i < maxDepth - 1; i++) {
+                next.add(frames.get(i));
+            }
+            return new Context(List.copyOf(next));
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            return obj instanceof Context other && frames.equals(other.frames);
+        }
+
+        @Override
+        public int hashCode() {
+            return frames.hashCode();
+        }
+
+        @Override
+        public String toString() {
+            if (frames.isEmpty()) {
+                return "<root>";
+            }
+            StringBuilder builder = new StringBuilder();
+            builder.append('[');
+            for (int i = 0; i < frames.size(); i++) {
+                if (i > 0) {
+                    builder.append(" -> ");
+                }
+                Invoke invoke = frames.get(i);
+                builder.append(invoke.getContainer().getName()).append(":").append(invoke.getIndex());
+            }
+            builder.append(']');
+            return builder.toString();
+        }
+    }
 
     static final class PointsRepository {
         private final Map<Node, Set<Obj>> pointsTo = new HashMap<>();
@@ -454,35 +548,42 @@ public final class ModularAndersenSolver {
     interface Node { }
 
     static final class VarNode implements Node {
+        final Context context;
         final Var var;
 
-        VarNode(Var var) {
+        VarNode(Context context, Var var) {
+            this.context = Objects.requireNonNull(context);
             this.var = Objects.requireNonNull(var);
         }
 
         @Override
         public boolean equals(Object obj) {
-            return obj instanceof VarNode other && var.equals(other.var);
+            if (!(obj instanceof VarNode other)) {
+                return false;
+            }
+            return context.equals(other.context) && var.equals(other.var);
         }
 
         @Override
         public int hashCode() {
-            return var.hashCode();
+            return Objects.hash(context, var);
         }
 
         @Override
         public String toString() {
-            return "VarNode{" + var + '}';
+            return "VarNode{" + var + "@" + context + '}';
         }
     }
 
     static final class FieldNode implements Node {
         final FieldRef fieldRef;
         final boolean isStatic;
+        final Context context;
 
-        FieldNode(FieldRef ref, boolean isStatic) {
+        FieldNode(FieldRef ref, boolean isStatic, Context context) {
             this.fieldRef = Objects.requireNonNull(ref);
             this.isStatic = isStatic;
+            this.context = Objects.requireNonNull(context);
         }
 
         @Override
@@ -490,64 +591,75 @@ public final class ModularAndersenSolver {
             if (!(obj instanceof FieldNode other)) {
                 return false;
             }
-            return isStatic == other.isStatic && fieldRef.equals(other.fieldRef);
+            return isStatic == other.isStatic && fieldRef.equals(other.fieldRef)
+                    && context.equals(other.context);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(fieldRef, isStatic);
+            return Objects.hash(fieldRef, isStatic, context);
         }
 
         @Override
         public String toString() {
-            return (isStatic ? "StaticField" : "Field") + '{' + fieldRef + '}';
+            return (isStatic ? "StaticField" : "Field") + '{' + fieldRef + "@" + context + '}';
         }
     }
 
     static final class ArrayNode implements Node {
+        final Context context;
         final Var arrayVar;
 
-        ArrayNode(Var arrayVar) {
+        ArrayNode(Context context, Var arrayVar) {
+            this.context = Objects.requireNonNull(context);
             this.arrayVar = Objects.requireNonNull(arrayVar);
         }
 
         @Override
         public boolean equals(Object obj) {
-            return obj instanceof ArrayNode other && arrayVar.equals(other.arrayVar);
+            if (!(obj instanceof ArrayNode other)) {
+                return false;
+            }
+            return context.equals(other.context) && arrayVar.equals(other.arrayVar);
         }
 
         @Override
         public int hashCode() {
-            return arrayVar.hashCode();
+            return Objects.hash(context, arrayVar);
         }
 
         @Override
         public String toString() {
-            return "ArrayNode{" + arrayVar + '}';
+            return "ArrayNode{" + arrayVar + "@" + context + '}';
         }
     }
 
     private static final class MethodSummary {
     @SuppressWarnings("unused")
     final JMethod method;
+    @SuppressWarnings("unused")
+    final Context context;
         final List<VarNode> formals = new ArrayList<>();
         final List<VarNode> returns = new ArrayList<>();
         VarNode thisNode;
 
-        MethodSummary(JMethod method) {
+        MethodSummary(JMethod method, Context context) {
             this.method = method;
+            this.context = context;
         }
     }
 
     private static final class CallSiteRecord {
         final Invoke invoke;
+        final Context context;
         final VarNode receiver;
         final VarNode result;
         final List<VarNode> arguments;
-        final Set<JMethod> resolvedCallees = new HashSet<>();
+        final Set<MethodKey> resolvedCallees = new HashSet<>();
 
-        CallSiteRecord(Invoke invoke, VarNode receiver, VarNode result, List<VarNode> arguments) {
+        CallSiteRecord(Invoke invoke, Context context, VarNode receiver, VarNode result, List<VarNode> arguments) {
             this.invoke = invoke;
+            this.context = context;
             this.receiver = receiver;
             this.result = result;
             this.arguments = arguments;

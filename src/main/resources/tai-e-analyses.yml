@@ -31,6 +31,7 @@
     # zipper | zipper-e | zipper-e=PV
     # scaler | scaler=TST
     # mahjong | collection
+    context-depth: 2 # default k for call-string sensitivity (set to 0 for insensitive)
     dump: false # whether dump points-to results (with contexts)
     dump-ci: false # whether dump points-to results (without contexts)
     dump-yaml: false # whether dump points-to results in yaml format
@@ -41,7 +42,7 @@
     # when this file is given, taint analysis will be enabled
     plugins: [ ] # | [ pluginClass, ... ]
     time-limit: -1 # set time limit (in seconds) for pointer analysis,
-    # -1 means no time limit
+    # -1 means no time limit (override via --analysis pku-pta=context-depth:<k>)
 
 - description: pta modular Andersen pointer analysis (field-insensitive)
   analysisClass: pta.andersen.AndersenPointerAnalysisAlias
@@ -66,6 +67,7 @@
     # zipper | zipper-e | zipper-e=PV
     # scaler | scaler=TST
     # mahjong | collection
+    context-depth: 1 # k for call-string sensitivity (0 => context-insensitive)
     dump: false # whether dump points-to results (with contexts)
     dump-ci: false # whether dump points-to results (without contexts)
     dump-yaml: false # whether dump points-to results in yaml format

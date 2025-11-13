@@ -29,7 +29,13 @@ public class AndersenPointerAnalysis extends ProgramAnalysis<PointerAnalysisResu
     public PointerAnalysisResult analyze() {
         HeapModel heapModel = new AllocationSiteBasedModel(getOptions());
         FieldPolicy fieldPolicy = createFieldPolicy();
-        ModularAndersenSolver solver = new ModularAndersenSolver(heapModel, fieldPolicy);
+        int contextDepth = resolveContextDepth();
+        if (contextDepth > 0) {
+            logger.info("Using {}-clone call-string sensitivity", contextDepth);
+        } else {
+            logger.info("Running in context-insensitive mode");
+        }
+        ModularAndersenSolver solver = new ModularAndersenSolver(heapModel, fieldPolicy, contextDepth);
         return solver.solve();
     }
 
@@ -51,6 +57,19 @@ public class AndersenPointerAnalysis extends ProgramAnalysis<PointerAnalysisResu
             default:
                 logger.warn("Unknown field-policy option '{}', falling back to insensitive", option);
                 return new FieldInsensitivePolicy();
+        }
+    }
+
+    private int resolveContextDepth() {
+        if (!getOptions().has("context-depth")) {
+            return 0;
+        }
+        try {
+            int depth = getOptions().getInt("context-depth");
+            return Math.max(0, depth);
+        } catch (RuntimeException ex) {
+            logger.warn("Invalid context-depth option, falling back to 0", ex);
+            return 0;
         }
     }
 }
