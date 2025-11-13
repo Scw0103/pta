@@ -34,6 +34,7 @@ import pascal.taie.ir.stmt.StoreField;
 import pascal.taie.ir.stmt.StmtVisitor;
 import pascal.taie.ir.stmt.Throw;
 import pascal.taie.language.classes.JMethod;
+import pascal.taie.language.type.ArrayType;
 import pascal.taie.analysis.misc.IRDumper;
 
 import org.apache.logging.log4j.LogManager;
@@ -205,6 +206,12 @@ public final class ModularAndersenSolver {
             VarNode from = getVarNode(stmt.getRValue().getValue(), context);
             VarNode to = getVarNode(stmt.getLValue(), context);
             graph.addEdge(from, to);
+            if (isArrayVar(stmt.getRValue().getValue()) && isArrayVar(stmt.getLValue())) {
+                ArrayNode fromArray = getArrayNode(stmt.getRValue().getValue(), context);
+                ArrayNode toArray = getArrayNode(stmt.getLValue(), context);
+                graph.addEdge(fromArray, toArray);
+                graph.addEdge(toArray, fromArray);
+            }
             return null;
         }
 
@@ -227,6 +234,12 @@ public final class ModularAndersenSolver {
             VarNode to = getVarNode(stmt.getLValue(), context);
             // 标量赋值：记录一条 from -> to 的流向边
             graph.addEdge(from, to);
+            if (isArrayVar(stmt.getRValue()) && isArrayVar(stmt.getLValue())) {
+                ArrayNode fromArray = getArrayNode(stmt.getRValue(), context);
+                ArrayNode toArray = getArrayNode(stmt.getLValue(), context);
+                graph.addEdge(fromArray, toArray);
+                graph.addEdge(toArray, fromArray);
+            }
             return null;
         }
 
@@ -337,6 +350,10 @@ public final class ModularAndersenSolver {
                 receivers.computeIfAbsent(site.receiver, key -> new ArrayList<>()).add(site);
             }
             return null;
+        }
+
+        private boolean isArrayVar(Var var) {
+            return var != null && var.getType() instanceof ArrayType;
         }
 
         private void handleInvokeDynamic(Invoke stmt) {
