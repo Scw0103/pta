@@ -32,6 +32,7 @@
     # scaler | scaler=TST
     # mahjong | collection
     context-depth: 2 # default k for call-string sensitivity (set to 0 for insensitive)
+    object-depth: 0 # depth for object-sensitive contexts (0 => disable object sensitivity)
     dump: false # whether dump points-to results (with contexts)
     dump-ci: false # whether dump points-to results (without contexts)
     dump-yaml: false # whether dump points-to results in yaml format
@@ -68,6 +69,7 @@
     # scaler | scaler=TST
     # mahjong | collection
     context-depth: 1 # k for call-string sensitivity (0 => context-insensitive)
+    object-depth: 0 # depth for object-sensitive contexts (0 => disable object sensitivity)
     dump: false # whether dump points-to results (with contexts)
     dump-ci: false # whether dump points-to results (without contexts)
     dump-yaml: false # whether dump points-to results in yaml format

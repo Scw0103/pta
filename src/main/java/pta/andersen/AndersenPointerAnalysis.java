@@ -32,10 +32,15 @@ public class AndersenPointerAnalysis extends ProgramAnalysis<PointerAnalysisResu
         int contextDepth = resolveContextDepth();
         if (contextDepth > 0) {
             logger.info("Using {}-clone call-string sensitivity", contextDepth);
-        } else {
+        }
+        int objectDepth = resolveObjectDepth();
+        if (objectDepth > 0) {
+            logger.info("Using {}-object-sensitive contexts", objectDepth);
+        }
+        if (contextDepth == 0 && objectDepth == 0) {
             logger.info("Running in context-insensitive mode");
         }
-        ModularAndersenSolver solver = new ModularAndersenSolver(heapModel, fieldPolicy, contextDepth);
+        ModularAndersenSolver solver = new ModularAndersenSolver(heapModel, fieldPolicy, contextDepth, objectDepth);
         return solver.solve();
     }
 
@@ -69,6 +74,19 @@ public class AndersenPointerAnalysis extends ProgramAnalysis<PointerAnalysisResu
             return Math.max(0, depth);
         } catch (RuntimeException ex) {
             logger.warn("Invalid context-depth option, falling back to 0", ex);
+            return 0;
+        }
+    }
+
+    private int resolveObjectDepth() {
+        if (!getOptions().has("object-depth")) {
+            return 0;
+        }
+        try {
+            int depth = getOptions().getInt("object-depth");
+            return Math.max(0, depth);
+        } catch (RuntimeException ex) {
+            logger.warn("Invalid object-depth option, falling back to 0", ex);
             return 0;
         }
     }

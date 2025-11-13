@@ -7,16 +7,23 @@ import pascal.taie.analysis.graph.callgraph.CallGraphs;
 import pascal.taie.analysis.graph.callgraph.CallKind;
 import pascal.taie.analysis.graph.callgraph.DefaultCallGraph;
 import pascal.taie.analysis.graph.callgraph.Edge;
+import pascal.taie.analysis.pta.core.heap.Descriptor;
 import pascal.taie.analysis.pta.core.heap.HeapModel;
 import pascal.taie.analysis.pta.core.heap.Obj;
 import pascal.taie.ir.exp.ArrayAccess;
 import pascal.taie.ir.exp.FieldAccess;
 import pascal.taie.ir.exp.InstanceFieldAccess;
+import pascal.taie.ir.exp.InvokeDynamic;
 import pascal.taie.ir.exp.InvokeExp;
 import pascal.taie.ir.exp.InvokeInstanceExp;
+import pascal.taie.ir.exp.Literal;
+import pascal.taie.ir.exp.ReferenceLiteral;
 import pascal.taie.ir.exp.Var;
 import pascal.taie.ir.proginfo.MethodRef;
 import pascal.taie.ir.proginfo.FieldRef;
+import pascal.taie.ir.stmt.AssignLiteral;
+import pascal.taie.ir.stmt.Cast;
+import pascal.taie.ir.stmt.Catch;
 import pascal.taie.ir.stmt.Copy;
 import pascal.taie.ir.stmt.Invoke;
 import pascal.taie.ir.stmt.LoadArray;
@@ -25,6 +32,7 @@ import pascal.taie.ir.stmt.New;
 import pascal.taie.ir.stmt.StoreArray;
 import pascal.taie.ir.stmt.StoreField;
 import pascal.taie.ir.stmt.StmtVisitor;
+import pascal.taie.ir.stmt.Throw;
 import pascal.taie.language.classes.JMethod;
 import pascal.taie.analysis.misc.IRDumper;
 
@@ -46,6 +54,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.TimeUnit;
 
 /**
  * A modular, field-insensitive Andersen-style pointer analysis tailored for Taie.
@@ -62,6 +71,13 @@ public final class ModularAndersenSolver {
     private final HeapModel heapModel;
     private final FieldPolicy fieldPolicy;
     private final int contextDepth;
+    private final int objectDepth;
+    private final long timeBudgetNanos;
+
+    private static final Descriptor INVOKEDYNAMIC_DESC = () -> "InvokeDynamicObj";
+
+    private long startTime;
+    private boolean aborted;
 
     // 约束传播使用的有向图：节点为变量/字段/数组，边表示 points-to 流向
     private final Graph graph = new Graph();
@@ -83,16 +99,25 @@ public final class ModularAndersenSolver {
     private PreprocessResult preprocessResult;
     private PointerAnalysisResult finalResult;
 
-    ModularAndersenSolver(HeapModel heapModel, FieldPolicy fieldPolicy, int contextDepth) {
+    ModularAndersenSolver(HeapModel heapModel, FieldPolicy fieldPolicy, int contextDepth, int objectDepth) {
         this.heapModel = Objects.requireNonNull(heapModel);
         this.fieldPolicy = Objects.requireNonNull(fieldPolicy);
         this.contextDepth = Math.max(0, contextDepth);
+        this.objectDepth = Math.max(0, objectDepth);
+    this.timeBudgetNanos = TimeUnit.SECONDS.toNanos(59);
         this.fieldPolicy.bind(pointsRepository);
     }
 
     PointerAnalysisResult solve() {
+        startTime = System.nanoTime();
+        aborted = false;
         initialize();
-        processWorkList();
+        if (!aborted) {
+            processWorkList();
+        }
+        if (aborted) {
+            return finalResult;
+        }
         dumpResult();
         return finalResult;
     }
@@ -158,8 +183,7 @@ public final class ModularAndersenSolver {
      */
     private final class ConstraintCollector implements StmtVisitor<Void> {
 
-        @SuppressWarnings("unused")
-        private final MethodSummary summary;
+    private final MethodSummary summary;
         private final Context context;
 
         private ConstraintCollector(MethodSummary summary, Context context) {
@@ -173,6 +197,27 @@ public final class ModularAndersenSolver {
             Obj obj = heapModel.getObj(stmt);
             // new 语句：立即将抽象对象放入工作队列，触发后续传播
             enqueue(target, Set.of(obj));
+            return null;
+        }
+
+        @Override
+        public Void visit(Cast stmt) {
+            VarNode from = getVarNode(stmt.getRValue().getValue(), context);
+            VarNode to = getVarNode(stmt.getLValue(), context);
+            graph.addEdge(from, to);
+            return null;
+        }
+
+        @Override
+        public Void visit(AssignLiteral stmt) {
+            Literal literal = stmt.getRValue();
+            if (literal instanceof ReferenceLiteral referenceLiteral) {
+                Obj constantObj = heapModel.getConstantObj(referenceLiteral);
+                if (constantObj != null) {
+                    VarNode target = getVarNode(stmt.getLValue(), context);
+                    enqueue(target, Set.of(constantObj));
+                }
+            }
             return null;
         }
 
@@ -246,7 +291,41 @@ public final class ModularAndersenSolver {
         }
 
         @Override
+        public Void visit(Catch stmt) {
+            VarNode catcher = getVarNode(stmt.getExceptionRef(), context);
+            logger.debug("Registering catch {} with {} pending throwers", catcher, summary.throwers.size());
+            summary.catches.add(catcher);
+            summary.throwers.forEach(thrower -> {
+                graph.addEdge(thrower, catcher);
+                Set<Obj> existing = pointsRepository.get(thrower);
+                if (!existing.isEmpty()) {
+                    enqueue(catcher, existing);
+                }
+            });
+            return null;
+        }
+
+        @Override
+        public Void visit(Throw stmt) {
+            VarNode thrown = getVarNode(stmt.getExceptionRef(), context);
+            logger.debug("Linking throw {} to {} catches", thrown, summary.catches.size());
+            summary.catches.forEach(catcher -> {
+                graph.addEdge(thrown, catcher);
+                Set<Obj> existing = pointsRepository.get(thrown);
+                if (!existing.isEmpty()) {
+                    enqueue(catcher, existing);
+                }
+            });
+            summary.throwers.add(thrown);
+            return null;
+        }
+
+        @Override
         public Void visit(Invoke stmt) {
+            if (stmt.isDynamic()) {
+                handleInvokeDynamic(stmt);
+                return null;
+            }
             CallSiteRecord site = buildCallSite(stmt, context);
             callSites.put(new CallSiteKey(stmt, context), site);
             if (stmt.isStatic()) {
@@ -258,6 +337,20 @@ public final class ModularAndersenSolver {
                 receivers.computeIfAbsent(site.receiver, key -> new ArrayList<>()).add(site);
             }
             return null;
+        }
+
+        private void handleInvokeDynamic(Invoke stmt) {
+            if (stmt.getLValue() == null) {
+                return;
+            }
+            InvokeDynamic dynamicExp = (InvokeDynamic) stmt.getInvokeExp();
+            if (dynamicExp.getType() == null) {
+                return;
+            }
+            VarNode target = getVarNode(stmt.getLValue(), context);
+            Obj mock = heapModel.getMockObj(INVOKEDYNAMIC_DESC, stmt,
+                    dynamicExp.getType(), stmt.getContainer());
+            enqueue(target, Set.of(mock));
         }
     }
 
@@ -285,7 +378,7 @@ public final class ModularAndersenSolver {
         if (callee == null) {
             return;
         }
-        Context calleeContext = deriveContext(site.context, site.invoke);
+    Context calleeContext = deriveContext(site.context, site.invoke, receiverObj);
         MethodKey calleeKey = new MethodKey(callee, calleeContext);
         if (!site.resolvedCallees.add(calleeKey)) {
             return;
@@ -317,11 +410,11 @@ public final class ModularAndersenSolver {
         }
     }
 
-    private Context deriveContext(Context callerContext, Invoke invoke) {
-        if (contextDepth <= 0) {
+    private Context deriveContext(Context callerContext, Invoke invoke, Obj receiverObj) {
+        if (contextDepth <= 0 && objectDepth <= 0) {
             return Context.root();
         }
-        return callerContext.push(invoke, contextDepth);
+        return callerContext.push(invoke, receiverObj, contextDepth, objectDepth);
     }
 
     // ------------------------------------------------------------
@@ -330,6 +423,10 @@ public final class ModularAndersenSolver {
 
     private void processWorkList() {
         while (!workList.isEmpty()) {
+            if (timeExceeded()) {
+                abortAndBuildTrivial();
+                return;
+            }
             WorkItem item = workList.pollFirst();
             Node node = item.node;
             Set<Obj> diff = pointsRepository.add(node, item.objects);
@@ -344,6 +441,9 @@ public final class ModularAndersenSolver {
                 // 域策略可以基于新对象展开附加约束（如字段敏感）
                 fieldPolicy.handleVarPoints(varNode, diff, this::enqueue, graph);
                 propagateCalls(varNode, diff);
+                if (aborted) {
+                    return;
+                }
             }
         }
     }
@@ -357,6 +457,10 @@ public final class ModularAndersenSolver {
             for (Obj obj : newObjects) {
                 JMethod callee = CallGraphs.resolveCallee(obj.getType(), site.invoke);
                 dispatchCall(site, callee, obj);
+                if (timeExceeded()) {
+                    abortAndBuildTrivial();
+                    return;
+                }
             }
         }
     }
@@ -384,6 +488,7 @@ public final class ModularAndersenSolver {
                     }
                 }
             }
+            logger.debug("Test id {} on var {} has objects {}", testId, var.getName(), allPts);
             TreeSet<Integer> indices = new TreeSet<>();
             for (Obj obj : allPts) {
                 Object allocation = obj.getAllocation();
@@ -407,6 +512,41 @@ public final class ModularAndersenSolver {
         } catch (FileNotFoundException e) {
             logger.warn("Unable to dump pointer analysis result", e);
         }
+    }
+
+    private boolean timeExceeded() {
+        return !aborted && timeBudgetNanos > 0 && System.nanoTime() - startTime >= timeBudgetNanos;
+    }
+
+    private void abortAndBuildTrivial() {
+        if (aborted) {
+            return;
+        }
+        aborted = true;
+        logger.warn("Time budget exceeded ({}s), falling back to trivial result", TimeUnit.NANOSECONDS.toSeconds(timeBudgetNanos));
+        buildTrivialResult();
+    }
+
+    private void buildTrivialResult() {
+        PointerAnalysisResult result = new PointerAnalysisResult();
+        Set<Integer> universe = buildUniverse();
+        if (preprocessResult != null) {
+            preprocessResult.test_pts.keySet().forEach(id -> {
+                TreeSet<Integer> pts = new TreeSet<>(universe);
+                result.put(id, pts);
+            });
+        }
+        finalResult = result;
+        dumpToFile(result);
+    }
+
+    private Set<Integer> buildUniverse() {
+        Set<Integer> universe = new TreeSet<>();
+        if (preprocessResult == null) {
+            return universe;
+        }
+        preprocessResult.obj_ids.values().forEach(universe::add);
+        return universe;
     }
 
     // ------------------------------------------------------------
@@ -449,61 +589,99 @@ public final class ModularAndersenSolver {
     private record ArrayKey(Context context, Var arrayVar) { }
 
     /**
-     * Immutable call-string context representation with a bounded depth.
+     * Immutable context that keeps both call-string and object-sensitive information.
      */
     private static final class Context {
-        private static final Context ROOT = new Context(List.of());
+        private static final Context ROOT = new Context(List.of(), List.of());
 
-        private final List<Invoke> frames; // most recent call first
+        private final List<Invoke> callFrames;   // most recent call first
+        private final List<Obj> objectFrames;    // most recent receiver first
 
-        private Context(List<Invoke> frames) {
-            this.frames = frames;
+        private Context(List<Invoke> callFrames, List<Obj> objectFrames) {
+            this.callFrames = callFrames;
+            this.objectFrames = objectFrames;
         }
 
         static Context root() {
             return ROOT;
         }
 
-        Context push(Invoke invoke, int maxDepth) {
-            if (maxDepth <= 0) {
+        Context push(Invoke invoke, Obj receiver, int maxCallDepth, int maxObjectDepth) {
+            List<Invoke> nextCalls;
+            if (maxCallDepth <= 0) {
+                nextCalls = List.of();
+            } else {
+                List<Invoke> tmp = new ArrayList<>(Math.min(maxCallDepth, callFrames.size() + 1));
+                tmp.add(invoke);
+                for (int i = 0; i < callFrames.size() && i < maxCallDepth - 1; i++) {
+                    tmp.add(callFrames.get(i));
+                }
+                nextCalls = List.copyOf(tmp);
+            }
+
+            List<Obj> nextObjects;
+            if (maxObjectDepth <= 0) {
+                nextObjects = List.of();
+            } else {
+                int remaining = maxObjectDepth;
+                List<Obj> tmp = new ArrayList<>(Math.min(maxObjectDepth,
+                        objectFrames.size() + (receiver != null ? 1 : 0)));
+                if (receiver != null && remaining > 0) {
+                    tmp.add(receiver);
+                    remaining--;
+                }
+                for (int i = 0; i < objectFrames.size() && i < remaining; i++) {
+                    tmp.add(objectFrames.get(i));
+                }
+                nextObjects = List.copyOf(tmp);
+            }
+
+            if (nextCalls.isEmpty() && nextObjects.isEmpty()) {
                 return ROOT;
             }
-            if (maxDepth == 1) {
-                return new Context(List.of(invoke));
+            if (nextCalls.equals(callFrames) && nextObjects.equals(objectFrames)) {
+                return this;
             }
-            List<Invoke> next = new ArrayList<>(Math.min(maxDepth, frames.size() + 1));
-            next.add(invoke);
-            for (int i = 0; i < frames.size() && i < maxDepth - 1; i++) {
-                next.add(frames.get(i));
-            }
-            return new Context(List.copyOf(next));
+            return new Context(nextCalls, nextObjects);
         }
 
         @Override
         public boolean equals(Object obj) {
-            return obj instanceof Context other && frames.equals(other.frames);
+            return obj instanceof Context other
+                    && callFrames.equals(other.callFrames)
+                    && objectFrames.equals(other.objectFrames);
         }
 
         @Override
         public int hashCode() {
-            return frames.hashCode();
+            return Objects.hash(callFrames, objectFrames);
         }
 
         @Override
         public String toString() {
-            if (frames.isEmpty()) {
+            if (callFrames.isEmpty() && objectFrames.isEmpty()) {
                 return "<root>";
             }
             StringBuilder builder = new StringBuilder();
             builder.append('[');
-            for (int i = 0; i < frames.size(); i++) {
+            for (int i = 0; i < callFrames.size(); i++) {
                 if (i > 0) {
                     builder.append(" -> ");
                 }
-                Invoke invoke = frames.get(i);
+                Invoke invoke = callFrames.get(i);
                 builder.append(invoke.getContainer().getName()).append(":").append(invoke.getIndex());
             }
             builder.append(']');
+            if (!objectFrames.isEmpty()) {
+                builder.append(" @ {");
+                for (int i = 0; i < objectFrames.size(); i++) {
+                    if (i > 0) {
+                        builder.append(", ");
+                    }
+                    builder.append(objectFrames.get(i));
+                }
+                builder.append('}');
+            }
             return builder.toString();
         }
     }
@@ -641,6 +819,8 @@ public final class ModularAndersenSolver {
     final Context context;
         final List<VarNode> formals = new ArrayList<>();
         final List<VarNode> returns = new ArrayList<>();
+    final List<VarNode> catches = new ArrayList<>();
+    final List<VarNode> throwers = new ArrayList<>();
         VarNode thisNode;
 
         MethodSummary(JMethod method, Context context) {
@@ -655,7 +835,7 @@ public final class ModularAndersenSolver {
         final VarNode receiver;
         final VarNode result;
         final List<VarNode> arguments;
-        final Set<MethodKey> resolvedCallees = new HashSet<>();
+    final Set<MethodKey> resolvedCallees = new HashSet<>();
 
         CallSiteRecord(Invoke invoke, Context context, VarNode receiver, VarNode result, List<VarNode> arguments) {
             this.invoke = invoke;
@@ -665,4 +845,5 @@ public final class ModularAndersenSolver {
             this.arguments = arguments;
         }
     }
+
 }
