@@ -32,6 +32,8 @@ import pascal.taie.ir.stmt.New;
 import pascal.taie.ir.stmt.StoreArray;
 import pascal.taie.ir.stmt.StoreField;
 import pascal.taie.ir.stmt.StmtVisitor;
+import pascal.taie.ir.stmt.Stmt;
+import pascal.taie.analysis.deadcode.DeadCodeDetection;
 import pascal.taie.ir.stmt.Throw;
 import pascal.taie.language.classes.JMethod;
 import pascal.taie.language.type.ArrayType;
@@ -155,8 +157,16 @@ public final class ModularAndersenSolver {
         MethodSummary summary = methodSummaries.computeIfAbsent(key,
                 k -> createSummary(k.method(), k.context()));
         logger.debug("Processing method {} @ {}", method.getSignature(), context);
-        // 首次遇到该方法时，对 IR 中的每条语句收集约束
-        method.getIR().getStmts().forEach(stmt -> stmt.accept(new ConstraintCollector(summary, context)));
+        // 首次遇到该方法时，对 IR 中的每条非死代码语句收集约束
+        Set<Stmt> deadTemp = method.getIR().getResult(DeadCodeDetection.ID);
+        final Set<Stmt> dead = deadTemp == null ? Set.of() : deadTemp;
+        method.getIR().getStmts().forEach(stmt -> {
+            if (!dead.contains(stmt)) {
+                stmt.accept(new ConstraintCollector(summary, context));
+            } else {
+                logger.debug("Skipping dead stmt {} in {}", stmt, method.getSignature());
+            }
+        });
     }
 
     private MethodSummary createSummary(JMethod method, Context context) {

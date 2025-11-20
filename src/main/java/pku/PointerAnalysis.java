@@ -3,6 +3,9 @@ package pku;
 import pascal.taie.World;
 import pascal.taie.analysis.ProgramAnalysis;
 import pascal.taie.config.AnalysisConfig;
+import pascal.taie.analysis.deadcode.DeadCodeDetection;
+
+
 public class PointerAnalysis extends PointerAnalysisTrivial
 {
     public static final String ID = "pku-pta";
