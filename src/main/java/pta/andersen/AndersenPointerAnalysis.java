@@ -10,6 +10,12 @@ import pascal.taie.analysis.ProgramAnalysis;
 import pascal.taie.analysis.pta.core.heap.AllocationSiteBasedModel;
 import pascal.taie.analysis.pta.core.heap.HeapModel;
 import pascal.taie.config.AnalysisConfig;
+import pascal.taie.World;
+import pascal.taie.analysis.deadcode.DeadCodeDetection;
+import pascal.taie.analysis.graph.cfg.CFGBuilder;
+import pascal.taie.analysis.dataflow.analysis.constprop.ConstantPropagation;
+import pascal.taie.analysis.dataflow.analysis.LiveVariable;
+import pascal.taie.ir.IR;
 
 /**
  * Entry point that wires the modular Andersen solver into Taie.
@@ -40,8 +46,44 @@ public class AndersenPointerAnalysis extends ProgramAnalysis<PointerAnalysisResu
         if (contextDepth == 0 && objectDepth == 0) {
             logger.info("Running in context-insensitive mode");
         }
-        ModularAndersenSolver solver = new ModularAndersenSolver(heapModel, fieldPolicy, contextDepth, objectDepth);
-        return solver.solve();
+
+            // Run required pre-analyses so DeadCodeDetection can produce results
+            pascal.taie.analysis.exception.ThrowAnalysis throwAnalysis =
+                    new pascal.taie.analysis.exception.ThrowAnalysis(
+                            AnalysisConfig.of(pascal.taie.analysis.exception.ThrowAnalysis.ID,
+                                    "exception", "explicit", "algorithm", "intra"));
+            CFGBuilder cfgBuilder = new CFGBuilder(AnalysisConfig.of(CFGBuilder.ID,
+                "exception", "explicit", "dump", false));
+            ConstantPropagation constProp = new ConstantPropagation(AnalysisConfig.of(ConstantPropagation.ID,
+                "edge-refine", true));
+            LiveVariable liveVar = new LiveVariable(AnalysisConfig.of(LiveVariable.ID,
+                "strongly", true));
+            DeadCodeDetection dead = new DeadCodeDetection(AnalysisConfig.of(DeadCodeDetection.ID));
+
+            World.get().getClassHierarchy().applicationClasses().forEach(jclass -> {
+                jclass.getDeclaredMethods().forEach(method -> {
+                        if (!method.isAbstract()) {
+                            IR ir = method.getIR();
+                            try {
+                                var throwRes = throwAnalysis.analyze(ir);
+                                ir.storeResult(pascal.taie.analysis.exception.ThrowAnalysis.ID, throwRes);
+                                var cfg = cfgBuilder.analyze(ir);
+                                ir.storeResult(CFGBuilder.ID, cfg);
+                                var cp = constProp.analyze(ir);
+                                ir.storeResult(ConstantPropagation.ID, cp);
+                                var lv = liveVar.analyze(ir);
+                                ir.storeResult(LiveVariable.ID, lv);
+                                var deadRes = dead.analyze(ir);
+                                ir.storeResult(DeadCodeDetection.ID, deadRes);
+                            } catch (RuntimeException ex) {
+                                logger.warn("Pre-analysis failed for method {}: {}", method.getSignature(), ex.toString());
+                            }
+                        }
+                });
+            });
+
+            ModularAndersenSolver solver = new ModularAndersenSolver(heapModel, fieldPolicy, contextDepth, objectDepth);
+            return solver.solve();
     }
 
     private FieldPolicy createFieldPolicy() {
