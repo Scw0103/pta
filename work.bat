@@ -1,1 +1,1 @@
-gradle run --args="-a pku-pta -cp src/test/pku -m test.DeadCodeCase"
+gradle run --args="-a pku-pta -cp src/test/pku -m test.ArraySensitivity"

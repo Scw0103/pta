@@ -34,6 +34,10 @@ import pascal.taie.ir.stmt.StoreField;
 import pascal.taie.ir.stmt.StmtVisitor;
 import pascal.taie.ir.stmt.Stmt;
 import pascal.taie.analysis.deadcode.DeadCodeDetection;
+import pascal.taie.analysis.dataflow.fact.NodeResult;
+import pascal.taie.analysis.dataflow.analysis.constprop.CPFact;
+import pascal.taie.analysis.dataflow.analysis.constprop.Value;
+import pascal.taie.analysis.dataflow.analysis.constprop.ConstantPropagation;
 import pascal.taie.ir.stmt.Throw;
 import pascal.taie.language.classes.JMethod;
 import pascal.taie.language.type.ArrayType;
@@ -93,6 +97,8 @@ public final class ModularAndersenSolver {
     private final Map<FieldKey, FieldNode> fieldNodes = new HashMap<>();
     private final Map<FieldRef, FieldNode> staticFieldNodes = new HashMap<>();
     private final Map<ArrayKey, ArrayNode> arrayNodes = new HashMap<>();
+    private final Map<ArrayElementKey, ElementNode> elementNodes = new HashMap<>();
+    private final Map<ArrayNode, Set<ArrayNode>> arrayAliases = new HashMap<>();
 
     private final Map<VarNode, List<CallSiteRecord>> receivers = new HashMap<>();
     private final Set<MethodKey> enqueuedMethods = new HashSet<>();
@@ -160,9 +166,10 @@ public final class ModularAndersenSolver {
         // 首次遇到该方法时，对 IR 中的每条非死代码语句收集约束
         Set<Stmt> deadTemp = method.getIR().getResult(DeadCodeDetection.ID);
         final Set<Stmt> dead = deadTemp == null ? Set.of() : deadTemp;
+        NodeResult<Stmt, CPFact> constants = method.getIR().getResult(ConstantPropagation.ID);
         method.getIR().getStmts().forEach(stmt -> {
             if (!dead.contains(stmt)) {
-                stmt.accept(new ConstraintCollector(summary, context));
+                stmt.accept(new ConstraintCollector(summary, context, constants));
             } else {
                 logger.debug("Skipping dead stmt {} in {}", stmt, method.getSignature());
             }
@@ -194,12 +201,14 @@ public final class ModularAndersenSolver {
      */
     private final class ConstraintCollector implements StmtVisitor<Void> {
 
-    private final MethodSummary summary;
+        private final MethodSummary summary;
         private final Context context;
+        private final NodeResult<Stmt, CPFact> constants;
 
-        private ConstraintCollector(MethodSummary summary, Context context) {
+        private ConstraintCollector(MethodSummary summary, Context context, NodeResult<Stmt, CPFact> constants) {
             this.summary = summary;
             this.context = context;
+            this.constants = constants;
         }
 
         @Override
@@ -221,6 +230,8 @@ public final class ModularAndersenSolver {
                 ArrayNode toArray = getArrayNode(stmt.getLValue(), context);
                 graph.addEdge(fromArray, toArray);
                 graph.addEdge(toArray, fromArray);
+                // record aliasing between arrays (cast can alias arrays)
+                recordArrayAlias(fromArray, toArray);
             }
             return null;
         }
@@ -249,6 +260,8 @@ public final class ModularAndersenSolver {
                 ArrayNode toArray = getArrayNode(stmt.getLValue(), context);
                 graph.addEdge(fromArray, toArray);
                 graph.addEdge(toArray, fromArray);
+                // record aliasing between array nodes so element nodes can be linked
+                recordArrayAlias(fromArray, toArray);
             }
             return null;
         }
@@ -297,9 +310,32 @@ public final class ModularAndersenSolver {
         public Void visit(StoreArray stmt) {
             VarNode value = getVarNode(stmt.getRValue(), context);
             ArrayAccess access = stmt.getArrayAccess();
-            ArrayNode array = getArrayNode(access.getBase(), context);
-            // 数组写：按 field-insensitive 策略把整个数组视为单节点
-            graph.addEdge(value, array);
+            Var base = access.getBase();
+            Var idxVar = access.getIndex();
+            Integer idx = null;
+            if (constants != null) {
+                CPFact fact = constants.getOutFact(stmt);
+                if (fact == null) {
+                    fact = constants.getInFact(stmt);
+                }
+                if (fact != null) {
+                    Value v = fact.get(idxVar);
+                    if (v.isConstant()) {
+                        idx = v.getConstant();
+                    }
+                }
+            }
+            if (idx != null) {
+                ElementNode elem = getElementNode(base, context, idx);
+                graph.addEdge(value, elem);
+                // also update whole-array abstraction so unknown-index loads see this store
+                ArrayNode array = getArrayNode(base, context);
+                graph.addEdge(value, array);
+            } else {
+                ArrayNode array = getArrayNode(base, context);
+                // fallback: whole-array
+                graph.addEdge(value, array);
+            }
             return null;
         }
 
@@ -307,9 +343,28 @@ public final class ModularAndersenSolver {
         public Void visit(LoadArray stmt) {
             VarNode target = getVarNode(stmt.getLValue(), context);
             ArrayAccess access = stmt.getArrayAccess();
-            ArrayNode array = getArrayNode(access.getBase(), context);
-            // 数组读：array -> target
-            graph.addEdge(array, target);
+            Var base = access.getBase();
+            Var idxVar = access.getIndex();
+            Integer idx = null;
+            if (constants != null) {
+                CPFact fact = constants.getOutFact(stmt);
+                if (fact == null) {
+                    fact = constants.getInFact(stmt);
+                }
+                if (fact != null) {
+                    Value v = fact.get(idxVar);
+                    if (v.isConstant()) {
+                        idx = v.getConstant();
+                    }
+                }
+            }
+            if (idx != null) {
+                ElementNode elem = getElementNode(base, context, idx);
+                graph.addEdge(elem, target);
+            } else {
+                ArrayNode array = getArrayNode(base, context);
+                graph.addEdge(array, target);
+            }
             return null;
         }
 
@@ -599,6 +654,35 @@ public final class ModularAndersenSolver {
         return arrayNodes.computeIfAbsent(key, k -> new ArrayNode(k.context(), k.arrayVar()));
     }
 
+    private ElementNode getElementNode(Var arrayVar, Context context, int index) {
+        ArrayElementKey key = new ArrayElementKey(context, arrayVar, index);
+        ElementNode node = elementNodes.computeIfAbsent(key,
+                k -> new ElementNode(k.context(), k.arrayVar(), k.index()));
+        // ensure alias propagation: if there are alias arrays, create corresponding element nodes and link them
+        ArrayNode baseArray = getArrayNode(arrayVar, context);
+        Set<ArrayNode> aliases = arrayAliases.get(baseArray);
+        if (aliases != null) {
+            for (ArrayNode alias : aliases) {
+                ElementNode aliasElem = elementNodes.computeIfAbsent(
+                        new ArrayElementKey(alias.context, alias.arrayVar, index),
+                        k -> new ElementNode(k.context(), k.arrayVar(), k.index()));
+                // connect corresponding element nodes both ways
+                graph.addEdge(node, aliasElem);
+                graph.addEdge(aliasElem, node);
+            }
+        }
+        // note: do NOT create array->element edges here; we keep array as the wildcard
+        // abstraction and per-index element nodes separate. Stores to concrete indices
+        // also update the array node (handled at the call site) so unknown-index loads
+        // remain sound without contaminating other concrete indices.
+        return node;
+    }
+
+    private void recordArrayAlias(ArrayNode a, ArrayNode b) {
+        arrayAliases.computeIfAbsent(a, k -> new HashSet<>()).add(b);
+        arrayAliases.computeIfAbsent(b, k -> new HashSet<>()).add(a);
+    }
+
     // ------------------------------------------------------------
     // Helper data structures
     // ------------------------------------------------------------
@@ -614,6 +698,38 @@ public final class ModularAndersenSolver {
     private record FieldKey(Context context, FieldRef fieldRef) { }
 
     private record ArrayKey(Context context, Var arrayVar) { }
+
+    private record ArrayElementKey(Context context, Var arrayVar, int index) { }
+
+    static final class ElementNode implements Node {
+        final Context context;
+        final Var arrayVar;
+        final int index;
+
+        ElementNode(Context context, Var arrayVar, int index) {
+            this.context = Objects.requireNonNull(context);
+            this.arrayVar = Objects.requireNonNull(arrayVar);
+            this.index = index;
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (!(obj instanceof ElementNode other)) {
+                return false;
+            }
+            return context.equals(other.context) && arrayVar.equals(other.arrayVar) && index == other.index;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(context, arrayVar, index);
+        }
+
+        @Override
+        public String toString() {
+            return "Elem{" + arrayVar + "[" + index + "]@" + context + '}';
+        }
+    }
 
     /**
      * Immutable context that keeps both call-string and object-sensitive information.
